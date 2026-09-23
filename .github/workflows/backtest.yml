@@ -1,0 +1,28 @@
+name: NAS100 Backtest
+
+on:
+  workflow_dispatch:
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run NAS100 backtest
+        run: python backtest.py
+
+      - name: Upload backtest results
+        uses: actions/upload-artifact@v4
+        with:
+          name: nas100-backtest-results
+          path: |
+            nas100_backtest_trades.csv
+            nas100_backtest_summary.json
