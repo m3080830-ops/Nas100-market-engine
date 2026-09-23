@@ -489,7 +489,12 @@ def recent_levels(
         index - lookback
     )
 
-    window = h1[start:index]
+    end = max(
+        start,
+        index - 1
+    )
+
+    window = h1[start:end]
 
     if len(window) < 10:
         return None, None
