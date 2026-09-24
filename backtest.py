@@ -1,12 +1,15 @@
 import csv
 import json
 import time
-import urllib.parse
-import urllib.request
+from collections import Counter
 from datetime import datetime, timezone
+
+import requests
+
 
 BASE_URL = "https://api.mexc.com/api/v1/contract/kline"
 SYMBOL = "NAS100_USDT"
+
 LOOKBACK_DAYS = 90
 LIMIT = 2000
 
@@ -18,443 +21,354 @@ TIMEFRAMES = {
     "M5": ("Min5", 300),
 }
 
+INITIAL_BALANCE = 10000.0
+RISK_PER_TRADE_R = 1.0
+
 MIN_RR = 1.5
 ATR_SL = 1.5
 TRAIL_R = 1.0
-MAX_TRADE_BARS = 288
+
+LOOKBACK_LEVELS = 30
+
+MAX_M15_CONFIRM_BARS = 8
+MAX_M5_ENTRY_BARS = 12
+MAX_TRADE_M5_BARS = 288
+
+OUT_TRADES = "nas100_backtest_trades.csv"
+OUT_SUMMARY = "nas100_backtest_summary.json"
 
 
-def get_json(url):
-    for attempt in range(4):
+def get_json(url, params, retries=4):
+    last_error = None
+
+    for attempt in range(retries):
         try:
-            req = urllib.request.Request(
+            response = requests.get(
                 url,
-                headers={"User-Agent": "NAS100-Backtest/3.0"},
+                params=params,
+                timeout=20,
             )
 
-            with urllib.request.urlopen(
-                req,
-                timeout=30
-            ) as response:
-                return json.loads(
-                    response.read().decode()
-                )
+            response.raise_for_status()
 
-        except Exception:
-            if attempt == 3:
-                raise
+            data = response.json()
 
-            time.sleep(
-                1 + attempt
+            if isinstance(data, dict) and data.get("success") is False:
+                raise RuntimeError(str(data))
+
+            return data
+
+        except Exception as exc:
+            last_error = exc
+            time.sleep(1 + attempt)
+
+    raise RuntimeError(
+        f"MEXC request failed: {last_error}"
+    )
+
+
+def fetch_klines(
+    interval,
+    seconds_per_bar,
+    start_ts,
+    end_ts,
+):
+    bars = []
+    cursor = start_ts
+    safety = 0
+
+    while cursor < end_ts and safety < 100:
+        safety += 1
+
+        batch_end = min(
+            end_ts,
+            cursor + seconds_per_bar * (LIMIT - 1),
+        )
+
+        params = {
+            "interval": interval,
+            "start": int(cursor),
+            "end": int(batch_end),
+        }
+
+        payload = get_json(
+            f"{BASE_URL}/{SYMBOL}",
+            params,
+        )
+
+        rows = (
+            payload.get("data", [])
+            if isinstance(payload, dict)
+            else []
+        )
+
+        if not rows:
+            break
+
+        times = rows["time"]
+
+        for i in range(len(times)):
+            ts = int(times[i])
+
+            if ts < start_ts or ts >= end_ts:
+                continue
+
+            bars.append(
+                {
+                    "ts": ts,
+                    "open": float(rows["open"][i]),
+                    "high": float(rows["high"][i]),
+                    "low": float(rows["low"][i]),
+                    "close": float(rows["close"][i]),
+                    "vol": float(rows["vol"][i]),
+                }
             )
 
+        last_ts = int(times[-1])
 
-def parse(obj):
-    data = obj["data"]
-
-    n = min(
-        len(data["time"]),
-        len(data["open"]),
-        len(data["high"]),
-        len(data["low"]),
-        len(data["close"]),
-    )
-
-    volumes = data.get(
-        "vol",
-        []
-    )
-
-    rows = []
-
-    for i in range(n):
-        rows.append(
-            {
-                "ts": int(
-                    data["time"][i]
-                ),
-                "open": float(
-                    data["open"][i]
-                ),
-                "high": float(
-                    data["high"][i]
-                ),
-                "low": float(
-                    data["low"][i]
-                ),
-                "close": float(
-                    data["close"][i]
-                ),
-                "volume": (
-                    float(volumes[i])
-                    if i < len(volumes)
-                    else 0.0
-                ),
-            }
-        )
-
-    return rows
-
-
-def fetch(interval, step):
-    end = int(
-        time.time()
-    )
-
-    start_wanted = (
-        end
-        - LOOKBACK_DAYS * 86400
-    )
-
-    rows = []
-
-    while end > start_wanted:
-
-        start = max(
-            start_wanted,
-            end - LIMIT * step
-        )
-
-        params = urllib.parse.urlencode(
-            {
-                "interval": interval,
-                "start": start,
-                "end": end,
-            }
-        )
-
-        url = (
-            f"{BASE_URL}/{SYMBOL}?{params}"
-        )
-
-        batch = parse(
-            get_json(url)
-        )
-
-        if not batch:
+        if last_ts < cursor:
             break
 
-        rows.extend(batch)
+        next_cursor = last_ts + seconds_per_bar
 
-        oldest = min(
-            x["ts"]
-            for x in batch
-        )
-
-        if oldest <= start_wanted:
+        if next_cursor <= cursor:
             break
 
-        end = (
-            oldest - step
-        )
-
-        time.sleep(0.15)
+        cursor = next_cursor
 
     unique = {
-        x["ts"]: x
-        for x in rows
+        bar["ts"]: bar
+        for bar in bars
     }
 
     return [
-        unique[k]
-        for k in sorted(unique)
-        if k >= start_wanted
+        unique[ts]
+        for ts in sorted(unique)
     ]
 
 
 def ema(values, period):
-    result = [
-        None
-        for _ in values
-    ]
+    out = [None] * len(values)
 
     if len(values) < period:
-        return result
+        return out
 
-    value = (
-        sum(values[:period])
-        / period
-    )
+    seed = sum(values[:period]) / period
 
-    result[period - 1] = value
+    out[period - 1] = seed
 
-    alpha = (
-        2 / (period + 1)
-    )
+    alpha = 2.0 / (period + 1.0)
 
-    for i in range(
-        period,
-        len(values)
-    ):
-        value = (
-            values[i] * alpha
-            + value * (1 - alpha)
+    previous = seed
+
+    for i in range(period, len(values)):
+        previous = (
+            (values[i] - previous) * alpha
+            + previous
         )
 
-        result[i] = value
+        out[i] = previous
 
-    return result
+    return out
 
 
 def rsi(values, period=14):
-    result = [
-        None
-        for _ in values
-    ]
+    out = [None] * len(values)
 
     if len(values) <= period:
-        return result
+        return out
 
-    gain = sum(
-        max(
-            values[i]
-            - values[i - 1],
-            0
-        )
-        for i in range(
-            1,
-            period + 1
-        )
-    ) / period
+    gains = 0.0
+    losses = 0.0
 
-    loss = sum(
-        max(
-            values[i - 1]
-            - values[i],
-            0
-        )
-        for i in range(
-            1,
-            period + 1
-        )
-    ) / period
+    for i in range(1, period + 1):
+        delta = values[i] - values[i - 1]
 
-    def calculate(
-        current_gain,
-        current_loss
-    ):
-        if current_loss == 0:
-            return 100.0
+        gains += max(delta, 0.0)
+        losses += max(-delta, 0.0)
 
-        rs = (
-            current_gain
-            / current_loss
+    avg_gain = gains / period
+    avg_loss = losses / period
+
+    if avg_loss == 0:
+        out[period] = 100.0
+    else:
+        rs = avg_gain / avg_loss
+        out[period] = 100.0 - (
+            100.0 / (1.0 + rs)
         )
 
-        return (
-            100
-            - 100 / (1 + rs)
-        )
+    for i in range(period + 1, len(values)):
+        delta = values[i] - values[i - 1]
 
-    result[period] = calculate(
-        gain,
-        loss
-    )
+        gain = max(delta, 0.0)
+        loss = max(-delta, 0.0)
 
-    for i in range(
-        period + 1,
-        len(values)
-    ):
-        change = (
-            values[i]
-            - values[i - 1]
-        )
-
-        current_gain = max(
-            change,
-            0
-        )
-
-        current_loss = max(
-            -change,
-            0
-        )
-
-        gain = (
-            gain * (period - 1)
-            + current_gain
+        avg_gain = (
+            (avg_gain * (period - 1))
+            + gain
         ) / period
 
-        loss = (
-            loss * (period - 1)
-            + current_loss
+        avg_loss = (
+            (avg_loss * (period - 1))
+            + loss
         ) / period
 
-        result[i] = calculate(
-            gain,
-            loss
-        )
+        if avg_loss == 0:
+            out[i] = 100.0
+        else:
+            rs = avg_gain / avg_loss
 
-    return result
+            out[i] = 100.0 - (
+                100.0 / (1.0 + rs)
+            )
+
+    return out
 
 
 def atr(bars, period=14):
-    result = [
-        None
-        for _ in bars
-    ]
+    out = [None] * len(bars)
 
     if len(bars) <= period:
-        return result
+        return out
 
-    true_ranges = []
+    true_ranges = [0.0] * len(bars)
 
     for i, bar in enumerate(bars):
 
         if i == 0:
-            value = (
-                bar["high"]
-                - bar["low"]
+            true_ranges[i] = (
+                bar["high"] - bar["low"]
             )
 
         else:
-            previous_close = (
-                bars[i - 1]["close"]
-            )
+            previous_close = bars[i - 1]["close"]
 
-            value = max(
-                bar["high"]
-                - bar["low"],
-
+            true_ranges[i] = max(
+                bar["high"] - bar["low"],
                 abs(
                     bar["high"]
                     - previous_close
                 ),
-
                 abs(
                     bar["low"]
                     - previous_close
                 ),
             )
 
-        true_ranges.append(
-            value
-        )
-
     value = (
-        sum(
-            true_ranges[
-                1:period + 1
-            ]
-        )
+        sum(true_ranges[1:period + 1])
         / period
     )
 
-    result[period] = value
+    out[period] = value
 
-    for i in range(
-        period + 1,
-        len(bars)
-    ):
-
+    for i in range(period + 1, len(bars)):
         value = (
-            (
-                value * (period - 1)
-                + true_ranges[i]
-            )
-            / period
-        )
+            (value * (period - 1))
+            + true_ranges[i]
+        ) / period
 
-        result[i] = value
+        out[i] = value
 
-    return result
+    return out
 
 
-def indicators(bars):
+def add_indicators(bars):
     closes = [
         bar["close"]
         for bar in bars
     ]
 
-    ema9 = ema(
-        closes,
-        9
-    )
-
-    ema18 = ema(
-        closes,
-        18
-    )
-
-    ema50 = ema(
-        closes,
-        50
-    )
+    ema9 = ema(closes, 9)
+    ema18 = ema(closes, 18)
+    ema50 = ema(closes, 50)
 
     rsi_values = rsi(
-        closes
+        closes,
+        14,
     )
 
     atr_values = atr(
-        bars
+        bars,
+        14,
     )
 
-    for i, bar in enumerate(
-        bars
-    ):
+    result = []
 
-        bar["ema9"] = ema9[i]
-        bar["ema18"] = ema18[i]
-        bar["ema50"] = ema50[i]
+    for i, bar in enumerate(bars):
 
-        bar["rsi"] = (
-            rsi_values[i]
-        )
+        item = dict(bar)
 
-        bar["atr"] = (
-            atr_values[i]
-        )
+        item["ema9"] = ema9[i]
+        item["ema18"] = ema18[i]
+        item["ema50"] = ema50[i]
+        item["rsi"] = rsi_values[i]
+        item["atr"] = atr_values[i]
+
+        result.append(item)
+
+    return result
 
 
-def idx(bars, timestamp):
-    left = 0
-    right = len(bars) - 1
-    answer = -1
+def latest_at_or_before(
+    bars,
+    ts,
+):
+    low = 0
+    high = len(bars) - 1
+    answer = None
 
-    while left <= right:
+    while low <= high:
 
-        middle = (
-            left + right
-        ) // 2
+        middle = (low + high) // 2
 
-        if (
-            bars[middle]["ts"]
-            <= timestamp
-        ):
-
-            answer = middle
-            left = middle + 1
+        if bars[middle]["ts"] <= ts:
+            answer = bars[middle]
+            low = middle + 1
 
         else:
-            right = middle - 1
+            high = middle - 1
 
     return answer
 
 
-def closed(
+def first_after(
     bars,
-    timestamp,
-    step
+    ts,
 ):
-    return idx(
-        bars,
-        timestamp - step
-    )
+    low = 0
+    high = len(bars)
+
+    while low < high:
+
+        middle = (low + high) // 2
+
+        if bars[middle]["ts"] <= ts:
+            low = middle + 1
+
+        else:
+            high = middle
+
+    return low
 
 
-def levels(
+def levels_from_h1(
     h1,
     index,
-    lookback=30
+    lookback=LOOKBACK_LEVELS,
 ):
     start = max(
         0,
-        index - lookback
+        index - lookback,
     )
 
-    window = h1[
-        start:index
-    ]
+    end = max(
+        start,
+        index - 1,
+    )
+
+    window = h1[start:end]
 
     if len(window) < 10:
         return None, None
@@ -469,918 +383,884 @@ def levels(
         for bar in window
     )
 
-    return (
-        resistance,
-        support
-    )
+    return resistance, support
 
 
-def direction(
+def htf_direction(
+    ts,
     d1,
     h4,
-    h1
+    h1,
 ):
-    bullish = 0
-    bearish = 0
-
-    for bar in (
+    d1_bar = latest_at_or_before(
         d1,
+        ts - 1,
+    )
+
+    h4_bar = latest_at_or_before(
         h4,
-        h1
+        ts - 1,
+    )
+
+    h1_bar = latest_at_or_before(
+        h1,
+        ts,
+    )
+
+    bars = [
+        d1_bar,
+        h4_bar,
+        h1_bar,
+    ]
+
+    if any(
+        bar is None
+        or bar["ema18"] is None
+        or bar["ema50"] is None
+        for bar in bars
     ):
+        return None
+
+    bullish = sum(
+        bar["ema18"] > bar["ema50"]
+        and bar["close"] > bar["ema50"]
+        for bar in bars
+    )
+
+    bearish = sum(
+        bar["ema18"] < bar["ema50"]
+        and bar["close"] < bar["ema50"]
+        for bar in bars
+    )
+
+    if bullish >= 2:
+        return "LONG"
+
+    if bearish >= 2:
+        return "SHORT"
+
+    return None
+
+
+def detect_h1_setup(
+    h1,
+    index,
+    direction,
+):
+    if index < 20:
+        return None
+
+    resistance, support = levels_from_h1(
+        h1,
+        index,
+    )
+
+    if resistance is None or support is None:
+        return None
+
+    current = h1[index]
+    previous = h1[index - 1]
+
+    atr_value = current["atr"]
+
+    if atr_value is None:
+        return None
+
+    if direction == "LONG":
+
+        swept = (
+            previous["low"] < support
+            and previous["close"] > support
+        )
+
+        momentum = (
+            current["close"] > current["open"]
+            and current["close"]
+            > previous["close"]
+        )
+
+        if swept and momentum:
+
+            return {
+                "direction": "LONG",
+                "setup_ts": current["ts"],
+                "setup_index": index,
+                "setup_end_ts": (
+                    current["ts"]
+                    + TIMEFRAMES["H1"][1]
+                ),
+                "support": support,
+                "resistance": resistance,
+                "atr": atr_value,
+            }
+
+    if direction == "SHORT":
+
+        swept = (
+            previous["high"] > resistance
+            and previous["close"] < resistance
+        )
+
+        momentum = (
+            current["close"] < current["open"]
+            and current["close"]
+            < previous["close"]
+        )
+
+        if swept and momentum:
+
+            return {
+                "direction": "SHORT",
+                "setup_ts": current["ts"],
+                "setup_index": index,
+                "setup_end_ts": (
+                    current["ts"]
+                    + TIMEFRAMES["H1"][1]
+                ),
+                "support": support,
+                "resistance": resistance,
+                "atr": atr_value,
+            }
+
+    return None
+
+
+def confirm_m15(
+    m15,
+    start_ts,
+    direction,
+):
+    start = first_after(
+        m15,
+        start_ts,
+    )
+
+    end = min(
+        len(m15),
+        start + MAX_M15_CONFIRM_BARS,
+    )
+
+    for i in range(start, end):
+
+        bar = m15[i]
 
         if (
-            not bar
-            or bar["ema18"] is None
+            bar["ema18"] is None
             or bar["ema50"] is None
+            or bar["rsi"] is None
         ):
             continue
 
-        if (
-            bar["close"]
-            > bar["ema50"]
-            and
-            bar["ema18"]
-            > bar["ema50"]
-        ):
-            bullish += 1
+        if direction == "LONG":
 
-        if (
-            bar["close"]
-            < bar["ema50"]
-            and
-            bar["ema18"]
-            < bar["ema50"]
-        ):
-            bearish += 1
+            if (
+                bar["close"] > bar["ema18"]
+                and bar["ema18"] > bar["ema50"]
+                and 52 <= bar["rsi"] <= 72
+            ):
+                return i, bar
 
-    if bullish >= 2:
-        return "BULLISH"
+        else:
 
-    if bearish >= 2:
-        return "BEARISH"
+            if (
+                bar["close"] < bar["ema18"]
+                and bar["ema18"] < bar["ema50"]
+                and 28 <= bar["rsi"] <= 48
+            ):
+                return i, bar
 
-    return "NEUTRAL"
+    return None, None
 
 
-def signal_at(
-    timestamp,
-    data
+def find_m5_entry(
+    m5,
+    start_ts,
+    direction,
 ):
+    start = first_after(
+        m5,
+        start_ts,
+    )
+
+    end = min(
+        len(m5),
+        start + MAX_M5_ENTRY_BARS,
+    )
+
+    for i in range(start, end):
+
+        bar = m5[i]
+
+        if (
+            bar["ema9"] is None
+            or bar["ema18"] is None
+            or bar["rsi"] is None
+        ):
+            continue
+
+        if direction == "LONG":
+
+            if (
+                bar["close"] > bar["ema9"]
+                and bar["ema9"] > bar["ema18"]
+                and bar["rsi"] >= 50
+            ):
+                return i, bar
+
+        else:
+
+            if (
+                bar["close"] < bar["ema9"]
+                and bar["ema9"] < bar["ema18"]
+                and bar["rsi"] <= 50
+            ):
+                return i, bar
+
+    return None, None
+
+
+def build_trade(
+    setup,
+    entry_index,
+    entry_bar,
+):
+    direction = setup["direction"]
+
+    entry = entry_bar["close"]
+
+    atr_value = (
+        entry_bar["atr"]
+        or setup["atr"]
+    )
+
+    if not atr_value or atr_value <= 0:
+        return None, "NO_ATR"
+
+    if direction == "LONG":
+
+        structural_sl = min(
+            setup["support"],
+            entry - ATR_SL * atr_value,
+        )
+
+        risk = entry - structural_sl
+
+        target = setup["resistance"]
+
+        if target <= entry:
+            return None, "NO_LONG_TARGET"
+
+        if risk <= 0:
+            return None, "NO_RISK"
+
+        rr = (
+            target - entry
+        ) / risk
+
+        if rr < MIN_RR:
+            return None, "RR_LT_MIN"
+
+        return {
+            "direction": direction,
+            "setup_ts": setup["setup_ts"],
+            "entry_ts": entry_bar["ts"],
+            "entry_index": entry_index,
+            "entry": entry,
+            "sl": structural_sl,
+            "tp": target,
+            "risk": risk,
+            "rr": rr,
+        }, None
+
+    structural_sl = max(
+        setup["resistance"],
+        entry + ATR_SL * atr_value,
+    )
+
+    risk = structural_sl - entry
+
+    target = setup["support"]
+
+    if target >= entry:
+        return None, "NO_SHORT_TARGET"
+
+    if risk <= 0:
+        return None, "NO_RISK"
+
+    rr = (
+        entry - target
+    ) / risk
+
+    if rr < MIN_RR:
+        return None, "RR_LT_MIN"
+
+    return {
+        "direction": direction,
+        "setup_ts": setup["setup_ts"],
+        "entry_ts": entry_bar["ts"],
+        "entry_index": entry_index,
+        "entry": entry,
+        "sl": structural_sl,
+        "tp": target,
+        "risk": risk,
+        "rr": rr,
+    }, None
+
+
+def simulate_trade(
+    trade,
+    m5,
+):
+    start = trade["entry_index"] + 1
+
+    end = min(
+        len(m5),
+        start + MAX_TRADE_M5_BARS,
+    )
+
+    direction = trade["direction"]
+
+    entry = trade["entry"]
+    sl = trade["sl"]
+    tp = trade["tp"]
+    risk = trade["risk"]
+
+    trail_active = False
+    best = entry
+
+    for i in range(start, end):
+
+        bar = m5[i]
+
+        if direction == "LONG":
+
+            best = max(
+                best,
+                bar["high"],
+            )
+
+            if (
+                not trail_active
+                and best - entry > TRAIL_R * risk
+            ):
+                trail_active = True
+
+            if bar["low"] <= sl:
+                return (
+                    -1.0,
+                    bar["ts"],
+                    "SL",
+                )
+
+            if bar["high"] >= tp:
+                return (
+                    (tp - entry) / risk,
+                    bar["ts"],
+                    "TP",
+                )
+
+            if trail_active:
+
+                trail = max(
+                    sl,
+                    best - risk,
+                )
+
+                if bar["low"] <= trail:
+                    return (
+                        (trail - entry) / risk,
+                        bar["ts"],
+                        "TRAIL",
+                    )
+
+        else:
+
+            best = min(
+                best,
+                bar["low"],
+            )
+
+            if (
+                not trail_active
+                and entry - best > TRAIL_R * risk
+            ):
+                trail_active = True
+
+            if bar["high"] >= sl:
+                return (
+                    -1.0,
+                    bar["ts"],
+                    "SL",
+                )
+
+            if bar["low"] <= tp:
+                return (
+                    (entry - tp) / risk,
+                    bar["ts"],
+                    "TP",
+                )
+
+            if trail_active:
+
+                trail = min(
+                    sl,
+                    best + risk,
+                )
+
+                if bar["high"] >= trail:
+                    return (
+                        (entry - trail) / risk,
+                        bar["ts"],
+                        "TRAIL",
+                    )
+
+    if end <= start:
+        return (
+            0.0,
+            trade["entry_ts"],
+            "NO_DATA",
+        )
+
+    last = m5[end - 1]
+
+    if direction == "LONG":
+        pnl_r = (
+            last["close"] - entry
+        ) / risk
+    else:
+        pnl_r = (
+            entry - last["close"]
+        ) / risk
+
+    return (
+        pnl_r,
+        last["ts"],
+        "TIMEOUT",
+    )
+
+
+def fmt_ts(ts):
+    return datetime.fromtimestamp(
+        ts,
+        tz=timezone.utc,
+    ).strftime(
+        "%Y-%m-%d %H:%M:%S UTC"
+    )
+
+
+def main():
+
+    end_ts = int(time.time())
+
+    start_ts = (
+        end_ts
+        - LOOKBACK_DAYS * 86400
+    )
+
+    print("=" * 50)
+    print("NAS100 BACKTEST")
+    print("=" * 50)
+
+    print(
+        f"Symbol: {SYMBOL}"
+    )
+
+    print(
+        f"Period: "
+        f"{fmt_ts(start_ts)}"
+        f" -> "
+        f"{fmt_ts(end_ts)}"
+    )
+
+    data = {}
+
+    for name, (
+        interval,
+        seconds_per_bar,
+    ) in TIMEFRAMES.items():
+
+        print(
+            f"Pobieranie {name}..."
+        )
+
+        bars = fetch_klines(
+            interval,
+            seconds_per_bar,
+            start_ts,
+            end_ts,
+        )
+
+        data[name] = add_indicators(
+            bars
+        )
+
+        print(
+            f"{name}: "
+            f"{len(data[name])} swiec"
+        )
+
     d1 = data["D1"]
     h4 = data["H4"]
     h1 = data["H1"]
     m15 = data["M15"]
     m5 = data["M5"]
 
-    h1_index = closed(
-        h1,
-        timestamp,
-        3600
-    )
-
-    m15_index = closed(
-        m15,
-        timestamp,
-        900
-    )
-
-    m5_index = idx(
-        m5,
-        timestamp
-    )
-
-    if (
-        h1_index < 31
-        or m15_index < 20
-        or m5_index < 20
-    ):
-        return None, "DATA"
-
-    h1_bar = h1[
-        h1_index
-    ]
-
-    m15_bar = m15[
-        m15_index
-    ]
-
-    m5_bar = m5[
-        m5_index
-    ]
-
-    required = (
-        h1_bar["atr"],
-        h1_bar["ema18"],
-        h1_bar["ema50"],
-        h1_bar["rsi"],
-        m15_bar["ema9"],
-        m15_bar["ema18"],
-        m5_bar["ema9"],
-    )
-
-    if any(
-        value is None
-        for value in required
-    ):
-        return None, "INDICATORS"
-
-    d1_index = idx(
-        d1,
-        timestamp - 86400
-    )
-
-    h4_index = idx(
-        h4,
-        timestamp - 14400
-    )
-
-    d1_bar = (
-        d1[d1_index]
-        if d1_index >= 0
-        else None
-    )
-
-    h4_bar = (
-        h4[h4_index]
-        if h4_index >= 0
-        else None
-    )
-
-    market_direction = direction(
-        d1_bar,
-        h4_bar,
-        h1_bar
-    )
-
-    if market_direction == "NEUTRAL":
-        return None, "HTF"
-
-    resistance, support = levels(
-        h1,
-        h1_index
-    )
-
-    if (
-        resistance is None
-        or support is None
-    ):
-        return None, "LEVEL"
-
-    previous = h1[
-        h1_index - 1
-    ]
-
-    long_sweep = (
-        previous["low"]
-        < support
-        and
-        h1_bar["close"]
-        > support
-    )
-
-    short_sweep = (
-        previous["high"]
-        > resistance
-        and
-        h1_bar["close"]
-        < resistance
-    )
-
-    if market_direction == "BULLISH":
-
-        if not long_sweep:
-            return None, "NO_LONG_SWEEP"
-
-        confirmation = (
-            m15_bar["close"]
-            > m15_bar["ema18"]
-            and
-            m15_bar["ema9"]
-            > m15_bar["ema18"]
-            and
-            m5_bar["close"]
-            > m5_bar["ema9"]
-        )
-
-        if not confirmation:
-            return None, "LONG_CONFIRMATION"
-
-        if not (
-            40
-            <= h1_bar["rsi"]
-            <= 70
-        ):
-            return None, "LONG_RSI"
-
-        entry = (
-            m5_bar["close"]
-        )
-
-        sl = (
-            min(
-                previous["low"],
-                support
-            )
-            - h1_bar["atr"]
-            * ATR_SL
-        )
-
-        tp = resistance
-
-        risk = (
-            entry - sl
-        )
-
-        reward = (
-            tp - entry
-        )
-
-        if (
-            risk <= 0
-            or reward <= 0
-        ):
-            return None, "LONG_RISK"
-
-        rr = reward / risk
-
-        if rr < MIN_RR:
-            return None, "LONG_RR"
-
-        return (
-            {
-                "side": "LONG",
-                "entry": entry,
-                "sl": sl,
-                "tp": tp,
-                "rr": rr,
-                "signal_ts": timestamp,
-            },
-            "READY",
-        )
-
-    if not short_sweep:
-        return None, "NO_SHORT_SWEEP"
-
-    confirmation = (
-        m15_bar["close"]
-        < m15_bar["ema18"]
-        and
-        m15_bar["ema9"]
-        < m15_bar["ema18"]
-        and
-        m5_bar["close"]
-        < m5_bar["ema9"]
-    )
-
-    if not confirmation:
-        return None, "SHORT_CONFIRMATION"
-
-    if not (
-        30
-        <= h1_bar["rsi"]
-        <= 60
-    ):
-        return None, "SHORT_RSI"
-
-    entry = (
-        m5_bar["close"]
-    )
-
-    sl = (
-        max(
-            previous["high"],
-            resistance
-        )
-        + h1_bar["atr"]
-        * ATR_SL
-    )
-
-    tp = support
-
-    risk = (
-        sl - entry
-    )
-
-    reward = (
-        entry - tp
-    )
-
-    if (
-        risk <= 0
-        or reward <= 0
-    ):
-        return None, "SHORT_RISK"
-
-    rr = reward / risk
-
-    if rr < MIN_RR:
-        return None, "SHORT_RR"
-
-    return (
-        {
-            "side": "SHORT",
-            "entry": entry,
-            "sl": sl,
-            "tp": tp,
-            "rr": rr,
-            "signal_ts": timestamp,
-        },
-        "READY",
-    )
-
-
-def simulate_trade(
-    signal,
-    m5,
-    start_index
-):
-    entry = signal["entry"]
-    sl = signal["sl"]
-    tp = signal["tp"]
-    side = signal["side"]
-
-    risk = abs(
-        entry - sl
-    )
-
-    best_price = entry
-    trailing_stop = None
-
-    end_index = min(
-        len(m5),
-        start_index
-        + MAX_TRADE_BARS
-    )
-
-    for i in range(
-        start_index,
-        end_index
-    ):
-
-        bar = m5[i]
-
-        if side == "LONG":
-
-            best_price = max(
-                best_price,
-                bar["high"]
-            )
-
-            if (
-                best_price - entry
-                > TRAIL_R * risk
-            ):
-                trailing_stop = max(
-                    entry,
-                    best_price - risk
-                )
-
-            if bar["low"] <= sl:
-                return (
-                    bar["ts"],
-                    sl,
-                    -1.0,
-                    "SL"
-                )
-
-            if (
-                trailing_stop is not None
-                and
-                bar["low"]
-                <= trailing_stop
-            ):
-                result_r = (
-                    trailing_stop - entry
-                ) / risk
-
-                return (
-                    bar["ts"],
-                    trailing_stop,
-                    result_r,
-                    "TRAIL"
-                )
-
-            if bar["high"] >= tp:
-                result_r = (
-                    tp - entry
-                ) / risk
-
-                return (
-                    bar["ts"],
-                    tp,
-                    result_r,
-                    "TP"
-                )
-
-        else:
-
-            best_price = min(
-                best_price,
-                bar["low"]
-            )
-
-            if (
-                entry - best_price
-                > TRAIL_R * risk
-            ):
-                trailing_stop = min(
-                    entry,
-                    best_price + risk
-                )
-
-            if bar["high"] >= sl:
-                return (
-                    bar["ts"],
-                    sl,
-                    -1.0,
-                    "SL"
-                )
-
-            if (
-                trailing_stop is not None
-                and
-                bar["high"]
-                >= trailing_stop
-            ):
-                result_r = (
-                    entry - trailing_stop
-                ) / risk
-
-                return (
-                    bar["ts"],
-                    trailing_stop,
-                    result_r,
-                    "TRAIL"
-                )
-
-            if bar["low"] <= tp:
-                result_r = (
-                    entry - tp
-                ) / risk
-
-                return (
-                    bar["ts"],
-                    tp,
-                    result_r,
-                    "TP"
-                )
-
-    last_bar = m5[
-        end_index - 1
-    ]
-
-    if side == "LONG":
-        result_r = (
-            last_bar["close"]
-            - entry
-        ) / risk
-    else:
-        result_r = (
-            entry
-            - last_bar["close"]
-        ) / risk
-
-    return (
-        last_bar["ts"],
-        last_bar["close"],
-        result_r,
-        "TIME"
-    )
-
-
-def iso(timestamp):
-    return datetime.fromtimestamp(
-        timestamp,
-        timezone.utc
-    ).isoformat()
-
-
-def main():
-
-    print(
-        "========================================"
-    )
-
-    print(
-        " NAS100 BACKTEST - 90 DNI"
-    )
-
-    print(
-        " MEXC FUTURES"
-    )
-
-    print(
-        "========================================"
-    )
-
-    data = {}
-
-    for (
-        timeframe,
-        values
-    ) in TIMEFRAMES.items():
-
-        interval, step = values
-
-        print(
-            f"Pobieranie {timeframe}..."
-        )
-
-        bars = fetch(
-            interval,
-            step
-        )
-
-        if len(bars) < 60:
-            raise RuntimeError(
-                f"Za malo danych dla "
-                f"{timeframe}: "
-                f"{len(bars)}"
-            )
-
-        indicators(bars)
-
-        data[timeframe] = bars
-
-        print(
-            f"{timeframe}: "
-            f"{len(bars)} swiec"
-        )
-
-    m5 = data["M5"]
+    stats = Counter()
 
     trades = []
 
-    reasons = {}
+    used_setup_ts = set()
 
-    next_allowed_ts = 0
+    print()
+    print("=" * 50)
+    print("DIAGNOSTYKA")
+    print("=" * 50)
 
-    printed_setup = set()
+    for i in range(20, len(h1)):
 
-    for i in range(
-        60,
-        len(m5)
-    ):
+        h1_bar = h1[i]
 
-        timestamp = m5[i]["ts"]
+        direction = htf_direction(
+            h1_bar["ts"],
+            d1,
+            h4,
+            h1,
+        )
 
-        if timestamp < next_allowed_ts:
+        if direction is None:
+            stats[
+                "NO_HTF_DIRECTION"
+            ] += 1
+
             continue
 
-        signal, reason = signal_at(
-            timestamp,
-            data
+        stats["HTF"] += 1
+
+        setup = detect_h1_setup(
+            h1,
+            i,
+            direction,
         )
 
-        reasons[reason] = (
-            reasons.get(
-                reason,
-                0
-            )
-            + 1
-        )
+        if setup is None:
 
-        if reason in (
-            "LONG_CONFIRMATION",
-            "SHORT_CONFIRMATION",
-        ):
+            if direction == "LONG":
+                stats[
+                    "NO_LONG_SWEEP"
+                ] += 1
 
-            h1_index = closed(
-                data["H1"],
-                timestamp,
-                3600
-            )
+            else:
+                stats[
+                    "NO_SHORT_SWEEP"
+                ] += 1
 
-            if (
-                h1_index >= 0
-                and
-                h1_index
-                not in printed_setup
-            ):
-
-                print(
-                    "H1 SETUP BEZ "
-                    "POTWIERDZENIA:",
-                    iso(timestamp),
-                    reason
-                )
-
-                printed_setup.add(
-                    h1_index
-                )
-
-        if signal is None:
             continue
-
-        print(
-            "SETUP POTWIERDZONY:",
-            iso(timestamp),
-            signal["side"],
-            "RR",
-            round(
-                signal["rr"],
-                2
-            )
-        )
 
         if (
-            i + 1
-            >= len(m5)
+            setup["setup_ts"]
+            in used_setup_ts
         ):
-            break
+            stats[
+                "DUPLICATE_SETUP"
+            ] += 1
 
-        (
-            exit_ts,
-            exit_price,
-            result_r,
-            exit_reason
-        ) = simulate_trade(
-            signal,
+            continue
+
+        used_setup_ts.add(
+            setup["setup_ts"]
+        )
+
+        stats[
+            f"H1_SETUP_{direction}"
+        ] += 1
+
+        print(
+            f"H1 SETUP {direction}: "
+            f"{fmt_ts(setup['setup_ts'])}"
+        )
+
+        m15_index, m15_bar = confirm_m15(
+            m15,
+            setup["setup_end_ts"],
+            direction,
+        )
+
+        if m15_bar is None:
+
+            stats[
+                f"NO_M15_CONFIRM_{direction}"
+            ] += 1
+
+            print(
+                "  -> brak M15 confirmation"
+            )
+
+            continue
+
+        stats[
+            f"M15_CONFIRM_{direction}"
+        ] += 1
+
+        print(
+            "  -> M15 confirmation: "
+            f"{fmt_ts(m15_bar['ts'])}"
+        )
+
+        m5_start_ts = (
+            m15_bar["ts"]
+            + TIMEFRAMES["M15"][1]
+        )
+
+        m5_index, m5_bar = find_m5_entry(
             m5,
-            i + 1
+            m5_start_ts,
+            direction,
         )
 
-        trades.append(
-            {
-                "case_id":
-                    f"NAS100-"
-                    f"{len(trades) + 1:05d}",
+        if m5_bar is None:
 
-                "signal_time":
-                    iso(
-                        timestamp
-                    ),
+            stats[
+                f"NO_M5_ENTRY_{direction}"
+            ] += 1
 
-                "exit_time":
-                    iso(
-                        exit_ts
-                    ),
+            print(
+                "  -> M15 OK, "
+                "brak M5 entry"
+            )
 
-                "side":
-                    signal["side"],
+            continue
 
-                "entry":
-                    round(
-                        signal["entry"],
-                        4
-                    ),
+        stats[
+            f"M5_ENTRY_{direction}"
+        ] += 1
 
-                "sl":
-                    round(
-                        signal["sl"],
-                        4
-                    ),
-
-                "tp":
-                    round(
-                        signal["tp"],
-                        4
-                    ),
-
-                "rr":
-                    round(
-                        signal["rr"],
-                        3
-                    ),
-
-                "exit_price":
-                    round(
-                        exit_price,
-                        4
-                    ),
-
-                "result_r":
-                    round(
-                        result_r,
-                        3
-                    ),
-
-                "exit_reason":
-                    exit_reason,
-            }
+        print(
+            "  -> M5 entry: "
+            f"{fmt_ts(m5_bar['ts'])}"
         )
 
-        next_allowed_ts = (
-            exit_ts + 300
+        trade, reject_reason = build_trade(
+            setup,
+            m5_index,
+            m5_bar,
         )
 
-    total = len(
-        trades
-    )
+        if trade is None:
+
+            stats[
+                reject_reason
+            ] += 1
+
+            print(
+                "  -> M5 OK, "
+                f"odrzucone: "
+                f"{reject_reason}"
+            )
+
+            continue
+
+        pnl_r, exit_ts, exit_reason = (
+            simulate_trade(
+                trade,
+                m5,
+            )
+        )
+
+        trade["m15_ts"] = m15_bar["ts"]
+        trade["m5_ts"] = m5_bar["ts"]
+
+        trade["exit_ts"] = exit_ts
+        trade["exit_reason"] = exit_reason
+        trade["pnl_r"] = pnl_r
+
+        trades.append(trade)
+
+        stats["TRADE"] += 1
+
+        print(
+            "  -> TRADE "
+            f"{direction} "
+            f"{pnl_r:.3f}R "
+            f"{exit_reason}"
+        )
 
     wins = sum(
-        trade["result_r"] > 0
+        trade["pnl_r"] > 0
         for trade in trades
     )
 
-    losses = (
-        total - wins
+    losses = sum(
+        trade["pnl_r"] <= 0
+        for trade in trades
     )
 
     total_r = sum(
-        trade["result_r"]
+        trade["pnl_r"]
         for trade in trades
     )
 
-    win_rate = (
-        wins / total * 100
-        if total
-        else 0.0
-    )
-
-    balance = 10000.0
+    balance = INITIAL_BALANCE
     peak = balance
-    max_drawdown = 0.0
+    max_dd = 0.0
 
     for trade in trades:
 
-        balance *= (
-            1
-            + 0.01
-            * trade["result_r"]
+        balance += (
+            trade["pnl_r"]
+            * 100.0
         )
 
         peak = max(
             peak,
-            balance
+            balance,
         )
 
-        drawdown = (
-            (peak - balance)
-            / peak
-            * 100
+        if peak:
+            dd = (
+                (peak - balance)
+                / peak
+                * 100.0
+            )
+        else:
+            dd = 0.0
+
+        max_dd = max(
+            max_dd,
+            dd,
         )
 
-        max_drawdown = max(
-            max_drawdown,
-            drawdown
+    print()
+    print("=" * 50)
+    print("DIAGNOSTYKA - PODSUMOWANIE")
+    print("=" * 50)
+
+    for key in sorted(stats):
+        print(
+            f"{key}: {stats[key]}"
         )
 
-    fields = [
-        "case_id",
-        "signal_time",
-        "exit_time",
-        "side",
-        "entry",
-        "sl",
-        "tp",
-        "rr",
-        "exit_price",
-        "result_r",
-        "exit_reason",
-    ]
+    print()
+    print("=" * 50)
+    print("WYNIK BACKTESTU")
+    print("=" * 50)
+
+    print(
+        f"Trade'y: {len(trades)}"
+    )
+
+    print(
+        f"Wygrane: {wins}"
+    )
+
+    print(
+        f"Przegrane: {losses}"
+    )
+
+    win_rate = (
+        wins / len(trades) * 100
+        if trades
+        else 0.0
+    )
+
+    print(
+        f"Win rate: "
+        f"{win_rate:.2f}%"
+    )
+
+    print(
+        f"Wynik: "
+        f"{total_r:.3f} R"
+    )
+
+    print(
+        f"Saldo koncowe: "
+        f"{balance:.2f}"
+    )
+
+    print(
+        f"Max DD: "
+        f"{max_dd:.2f}%"
+    )
 
     with open(
-        "nas100_backtest_trades.csv",
+        OUT_TRADES,
         "w",
         newline="",
-        encoding="utf-8"
-    ) as file:
+        encoding="utf-8",
+    ) as f:
 
         writer = csv.DictWriter(
-            file,
-            fieldnames=fields
+            f,
+            fieldnames=[
+                "direction",
+                "setup_ts",
+                "m15_ts",
+                "m5_ts",
+                "entry_ts",
+                "entry",
+                "sl",
+                "tp",
+                "risk",
+                "rr",
+                "exit_ts",
+                "exit_reason",
+                "pnl_r",
+            ],
         )
 
         writer.writeheader()
 
-        writer.writerows(
-            trades
-        )
+        for trade in trades:
+
+            row = dict(trade)
+
+            for key in (
+                "setup_ts",
+                "m15_ts",
+                "m5_ts",
+                "entry_ts",
+                "exit_ts",
+            ):
+                row[key] = fmt_ts(
+                    row[key]
+                )
+
+            writer.writerow(row)
 
     summary = {
         "symbol": SYMBOL,
-        "lookback_days":
-            LOOKBACK_DAYS,
-
+        "lookback_days": LOOKBACK_DAYS,
         "bars": {
-            key: len(value)
-            for key, value
-            in data.items()
+            name: len(values)
+            for name, values in data.items()
         },
-
-        "trades":
-            total,
-
-        "wins":
-            wins,
-
-        "losses":
-            losses,
-
-        "win_rate_pct":
-            round(
-                win_rate,
-                2
-            ),
-
-        "total_r":
-            round(
-                total_r,
-                3
-            ),
-
-        "ending_balance":
-            round(
-                balance,
-                2
-            ),
-
-        "max_drawdown_pct":
-            round(
-                max_drawdown,
-                2
-            ),
-
-        "diagnostics":
-            reasons,
+        "diagnostics": dict(stats),
+        "trades": len(trades),
+        "wins": wins,
+        "losses": losses,
+        "win_rate_pct": win_rate,
+        "result_r": total_r,
+        "final_balance": balance,
+        "max_drawdown_pct": max_dd,
     }
 
     with open(
-        "nas100_backtest_summary.json",
+        OUT_SUMMARY,
         "w",
-        encoding="utf-8"
-    ) as file:
+        encoding="utf-8",
+    ) as f:
 
         json.dump(
             summary,
-            file,
+            f,
             indent=2,
-            ensure_ascii=False
+            ensure_ascii=False,
         )
 
     print()
-
-    print(
-        "========================================"
-    )
-
-    print(
-        " DIAGNOSTYKA"
-    )
-
-    print(
-        "========================================"
-    )
-
-    for (
-        reason,
-        count
-    ) in sorted(
-        reasons.items(),
-        key=lambda x: -x[1]
-    ):
-
-        print(
-            f"{reason}: {count}"
-        )
-
-    print()
-
-    print(
-        "========================================"
-    )
-
-    print(
-        " WYNIK BACKTESTU"
-    )
-
-    print(
-        "========================================"
-    )
-
-    print(
-        f"Trade'y:       {total}"
-    )
-
-    print(
-        f"Wygrane:       {wins}"
-    )
-
-    print(
-        f"Przegrane:     {losses}"
-    )
-
-    print(
-        f"Win rate:      {win_rate:.2f}%"
-    )
-
-    print(
-        f"Wynik:         {total_r:.3f} R"
-    )
-
-    print(
-        f"Saldo koncowe: {balance:.2f}"
-    )
-
-    print(
-        f"Max DD:        {max_drawdown:.2f}%"
-    )
-
-    print(
-        "========================================"
-    )
+    print("Zapisano:")
+    print(OUT_TRADES)
+    print(OUT_SUMMARY)
 
 
 if __name__ == "__main__":
