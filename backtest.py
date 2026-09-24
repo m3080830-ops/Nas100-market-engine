@@ -1140,7 +1140,7 @@ if i + 1 >= len(m5): break
 
 exit_ts, exit_price, result_r, exit_reason = simulate_trade(signal, m5, i + 1)   
 
-        trades.append({
+trades.append({
             "case_id":
                 f"NAS100-{len(trades) + 1:05d}",
 
