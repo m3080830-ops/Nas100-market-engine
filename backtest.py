@@ -1126,12 +1126,15 @@ def main():
             continue
 
         signal = build_signal(
-            timestamp,
-            data
-        )
+    timestamp,
+    data
+)
 
-        if not signal:
-            continue
+if signal:
+    print("SETUP:", timestamp, signal)
+
+if not signal:
+    continue
 
         if i + 1 >= len(m5):
             break
