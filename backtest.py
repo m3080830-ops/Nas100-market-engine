@@ -1136,19 +1136,10 @@ if signal:
 if not signal:
     continue
 
-        if i + 1 >= len(m5):
-            break
+if i + 1 >= len(m5):
+break
 
-        (
-            exit_ts,
-            exit_price,
-            result_r,
-            exit_reason
-        ) = simulate_trade(
-            signal,
-            m5,
-            i + 1
-        )
+exit_ts, exit_price, result_r, exit_reason = simulate_trade(signal, m5, i + 1)   
 
         trades.append({
             "case_id":
