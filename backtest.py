@@ -1225,7 +1225,12 @@ def main():
                     row[key]
                 )
 
-            writer.writerow(row)
+            writer.writerow({
+                key: row.get(key)
+                for key in
+writer.fieldnames
+            })
+        
 
     summary = {
         "symbol": SYMBOL,
